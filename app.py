@@ -1,88 +1,183 @@
 from flask import Flask, request, jsonify
-import boto3
-import pandas as pd
+from flask_cors import CORS
 import os
 
-app = Flask(__name__)
+from preprocessing import preprocess_data
+from storage import upload_to_s3
+from embedding import index_csv_file, search_index
+from config import S3_BUCKET, s3_client
+from bedrock_integration import generate_response_from_context, query_bedrock
+from rag_utils import (
+    load_faiss_index_from_paths,
+    get_context_records,
+    format_prompt_for_prediction
+)
+from config import grading_scheme_map
+from batch_prediction import extract_multi_scores
+import json
+import tempfile
+from config import S3_BUCKET, s3_client
 
-# AWS S3 Configuration
-S3_BUCKET = "early-intervention-data"
-s3_client = boto3.client("s3")
+
+app = Flask(__name__)
+CORS(app)
 
 
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify({"message": "Flask App Running on AWS Lambda!"})
+    return jsonify({"message": "Flask App Running!"})
 
 
 @app.route("/preprocess", methods=["POST"])
 def preprocess():
     try:
-        # Get JSON data from request
         data = request.get_json()
-
-        # Extract grades, weightage, class attribute, and course name
         grades = data["grades"]
         weightage = data["gradingScheme"]
         class_attribute = data["classAttribute"]
-        course_name = data["courseName"].replace(" ", "_")  # Ensure filename is safe
+        course_name = data["courseName"].replace(" ", "_")
 
-        # Convert JSON to Pandas DataFrame
-        df = pd.DataFrame(grades)
+        # Preprocess grades
+        normalized_df = preprocess_data(grades, weightage)
 
-        # Handle missing values by replacing with 0
-        df.fillna(0, inplace=True)
-
-        # Normalize data based on weightage
-        normalized_df = normalize_data(df, weightage)
-
-        # Save to /tmp/ (Lambda allows writes only here)
+        # Save preprocessed CSV
         csv_filename = f"/tmp/{course_name}_preprocessed.csv"
         normalized_df.to_csv(csv_filename, index=False)
+        upload_to_s3(csv_filename, f"{course_name}_preprocessed.csv")
 
-        # Upload to S3
-        s3_client.upload_file(csv_filename, S3_BUCKET, f"{course_name}_preprocessed.csv")
+        # Save FAISS index
+        index_path = index_csv_file(csv_filename, course_name)
+        upload_to_s3(index_path, f"{course_name}_faiss.index")
+
+        # ✅ Extract column list and exclude class attribute if needed
+        column_list = list(normalized_df.columns)
+
+        # Save metadata (✅ added "columns")
+        metadata = {
+            "courseName": course_name,
+            "gradingScheme": weightage,
+            "classAttribute": class_attribute,
+            "columns": column_list,
+            "numRecords": len(normalized_df),
+            "numFeatures": len(normalized_df.columns)
+        }
+
+        meta_path = f"/tmp/{course_name}_metadata.json"
+        with open(meta_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+        upload_to_s3(meta_path, f"{course_name}_metadata.json")
 
         return jsonify({
-            "message": f"Data preprocessed and uploaded to S3 as {course_name}_preprocessed.csv!",
-            "classAttribute": class_attribute
+            "message": "Preprocessing successful. CSV, index, and metadata uploaded.",
+            "csv_file": f"{course_name}_preprocessed.csv",
+            "index_file": f"{course_name}_faiss.index",
+            "metadata_file": f"{course_name}_metadata.json"
+        })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+
+@app.route("/models", methods=["GET"])
+def list_models():
+    try:
+        response = s3_client.list_objects_v2(Bucket=S3_BUCKET)
+        files = response.get("Contents", [])
+
+        metadata_files = [f["Key"] for f in files if f["Key"].endswith("_metadata.json")]
+
+        models = {}
+        for key in metadata_files:
+            course_name = key.replace("_metadata.json", "")
+            local_path = f"/tmp/{key}"
+            s3_client.download_file(S3_BUCKET, key, local_path)
+
+            with open(local_path, "r") as f:
+                metadata = json.load(f)
+
+            models[course_name] = metadata
+
+        return jsonify(models)
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+
+@app.route("/predict-individual", methods=["POST"])
+def predict_individual():
+    try:
+        data = request.get_json()
+        course = data["courseName"].replace(" ", "_")
+        selected_attributes = data["selectedAttributes"]
+        input_values = data["inputValues"]
+        comment = data.get("comment", "")
+
+        csv_path = f"/tmp/{course}_preprocessed.csv"
+        index_path = f"/tmp/{course}_faiss.index"
+
+        s3_client.download_file(S3_BUCKET, f"{course}_preprocessed.csv", csv_path)
+        s3_client.download_file(S3_BUCKET, f"{course}_faiss.index", index_path)
+
+        index, df = load_faiss_index_from_paths(index_path, csv_path)
+        similar_records = get_context_records(df, index, input_values, selected_attributes)
+
+        grading_scheme = grading_scheme_map.get(course, {})
+        prompt = format_prompt_for_prediction(input_values, selected_attributes, similar_records, grading_scheme, comment)
+        raw_response = query_bedrock(prompt)
+        scores = extract_multi_scores(raw_response)
+
+        return jsonify({
+            "input": input_values,
+            "context": similar_records,
+            "prompt": prompt,
+            "prediction": {
+                "Optimistic": scores["Optimistic"],
+                "Base": scores["Base"],
+                "Pessimistic": scores["Pessimistic"]
+            }
         })
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-def normalize_data(df, weightage):
-    """
-    Normalize data based on the weightage provided.
-    If multiple columns belong to the same entity (e.g., Quiz1, Quiz2), split the weightage equally.
-    """
-    normalized_df = df.copy()
+@app.route("/predict-batch", methods=["POST"])
+def predict_batch():
+    try:
+        file = request.files["file"]
+        course = request.form["courseName"]
+        threshold = float(request.form.get("threshold", 35))
+        email = request.form.get("email", "instructor@example.com")
 
-    # Identify grouped entities (e.g., "Quiz1", "Quiz2" should share the "Quiz" weightage)
-    entity_groups = {}
-    for col in df.columns:
-        for entity in weightage.keys():
-            # Convert both to lowercase and remove spaces for better matching
-            formatted_entity = entity.replace(" ", "").lower()
-            formatted_col = col.replace(" ", "").lower()
+        temp_path = f"/tmp/{file.filename}"
+        file.save(temp_path)
 
-            if formatted_col.startswith(formatted_entity):  # Match "LabTest1" with "Lab Test"
-                if entity not in entity_groups:
-                    entity_groups[entity] = []
-                entity_groups[entity].append(col)
+        s3_client.upload_file(temp_path, S3_BUCKET, file.filename)
 
-    # Normalize based on weightage
-    for entity, columns in entity_groups.items():
-        total_weight = weightage.get(entity, 0)
-        split_weight = total_weight / len(columns)  # Distribute weightage evenly
+        from batch_prediction import run_batch_prediction
+        result = run_batch_prediction(file.filename, course, threshold, email)
 
-        for col in columns:
-            max_value = df[col].max() if df[col].max() > 0 else 1  # Avoid division by zero
-            normalized_df[col] = ((df[col] / max_value) * split_weight).round(2)  # Normalize & format to 2 decimals
+        print("Batch Prediction Result (final):", result)
 
-    return normalized_df
+        if not result or "report_url" not in result or "at_risk_count" not in result:
+            raise ValueError("Batch result missing expected keys")
 
+        return jsonify({
+            "message": "Batch prediction completed.",
+            "reportUrl": result["report_url"],
+            "atRiskCount": result["at_risk_count"]
+        }), 200
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":

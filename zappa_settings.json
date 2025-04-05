@@ -1,17 +1,29 @@
 {
-    "dev": {
-        "app_function": "app.app",
-        "aws_region": "us-east-1",
-        "exclude": [
-            "boto3",
-            "dateutil",
-            "botocore",
-            "s3transfer",
-            "concurrent"
-        ],
-        "profile_name": "default",
-        "project_name": "flask",
-        "runtime": "python3.11",
-        "s3_bucket": "zappa-3uh3ntyar"
+  "dev": {
+    "app_function": "app.app",
+    "aws_region": "us-east-1",
+    "profile_name": "default",
+    "project_name": "flask",
+    "runtime": "python3.11",
+    "s3_bucket": "zappa-3uh3ntyar",
+    "slim_handler": true,
+    "exclude": [
+      "boto3",
+      "botocore",
+      "s3transfer",
+      "concurrent",
+      "torch",
+      "numpy",
+      "scikit-learn",
+      "sentence-transformers",
+      "faiss",
+      "transformers",
+      "regex",
+      "tokenizers",
+      "safetensors"
+    ],
+    "environment_variables": {
+      "IS_LAMBDA": "true"
     }
+  }
 }
