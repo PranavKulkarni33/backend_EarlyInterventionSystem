@@ -45,9 +45,8 @@ Answer:"""
 
 
 def query_bedrock(prompt, model_id="amazon.titan-text-express-v1"):
-    """
-    Sends a prompt to Bedrock and returns the model's response.
-    """
+    print("\n🔍 PROMPT TO BEDROCK:\n" + prompt + "\n")  # ✅ LOG HERE
+
     payload = {
         "inputText": prompt,
         "textGenerationConfig": {
@@ -65,15 +64,11 @@ def query_bedrock(prompt, model_id="amazon.titan-text-express-v1"):
             accept="application/json"
         )
         raw = response["body"].read().decode("utf-8")
-        print("Raw Bedrock response:", raw)
-
+        print("📨 Raw Bedrock Response:", raw)
         data = json.loads(raw)
-        output = data.get("results", [{}])[0].get("outputText")
-        if not output:
-            raise ValueError("Missing 'outputText' in Bedrock response")
-
-        return output
+        return data["results"][0]["outputText"]
     except Exception as e:
-        print(f"Bedrock API error: {e}")
-        return "outputText missing in response"
+        print(f"❌ Bedrock API error: {e}")
+        return None
+
 

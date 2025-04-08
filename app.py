@@ -34,11 +34,12 @@ def preprocess():
         data = request.get_json()
         grades = data["grades"]
         weightage = data["gradingScheme"]
+        out_of_marks = data.get("outOfMarks", {})
         class_attribute = data["classAttribute"]
         course_name = data["courseName"].replace(" ", "_")
 
-        # Preprocess grades
-        normalized_df = preprocess_data(grades, weightage)
+        # Preprocess grades using weights and outOf
+        normalized_df = preprocess_data(grades, weightage, out_of_marks)
 
         # Save preprocessed CSV
         csv_filename = f"/tmp/{course_name}_preprocessed.csv"
@@ -49,13 +50,12 @@ def preprocess():
         index_path = index_csv_file(csv_filename, course_name)
         upload_to_s3(index_path, f"{course_name}_faiss.index")
 
-        # ✅ Extract column list and exclude class attribute if needed
+        # Save metadata including outOf marks
         column_list = list(normalized_df.columns)
-
-        # Save metadata (✅ added "columns")
         metadata = {
             "courseName": course_name,
             "gradingScheme": weightage,
+            "outOfMarks": out_of_marks,
             "classAttribute": class_attribute,
             "columns": column_list,
             "numRecords": len(normalized_df),
@@ -78,7 +78,6 @@ def preprocess():
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
-
 
 
 @app.route("/models", methods=["GET"])
@@ -108,7 +107,6 @@ def list_models():
         return jsonify({"error": str(e)}), 500
 
 
-
 @app.route("/predict-individual", methods=["POST"])
 def predict_individual():
     try:
@@ -118,32 +116,53 @@ def predict_individual():
         input_values = data["inputValues"]
         comment = data.get("comment", "")
 
+        # Load metadata
+        meta_path = f"/tmp/{course}_metadata.json"
+        s3_client.download_file(S3_BUCKET, f"{course}_metadata.json", meta_path)
+        with open(meta_path, "r") as f:
+            metadata = json.load(f)
+
+        grading_scheme = metadata.get("gradingScheme", {})
+        out_of_marks = metadata.get("outOfMarks", {})
+
+        # Normalize input
+        normalized_input = {}
+        for attr in selected_attributes:
+            raw_score = float(input_values.get(attr, 0))
+            max_score = float(out_of_marks.get(attr, 1))
+            normalized_input[attr] = round((raw_score / max_score) * 100, 2)
+
+        # Load FAISS and context
         csv_path = f"/tmp/{course}_preprocessed.csv"
         index_path = f"/tmp/{course}_faiss.index"
-
         s3_client.download_file(S3_BUCKET, f"{course}_preprocessed.csv", csv_path)
         s3_client.download_file(S3_BUCKET, f"{course}_faiss.index", index_path)
 
         index, df = load_faiss_index_from_paths(index_path, csv_path)
-        similar_records = get_context_records(df, index, input_values, selected_attributes)
+        similar_records = get_context_records(df, index, normalized_input, selected_attributes, top_k=10)
 
-        grading_scheme = grading_scheme_map.get(course, {})
-        prompt = format_prompt_for_prediction(input_values, selected_attributes, similar_records, grading_scheme, comment)
+        # Generate prompt and call Bedrock
+        prompt = format_prompt_for_prediction(normalized_input, selected_attributes, similar_records, grading_scheme, comment)
         raw_response = query_bedrock(prompt)
         scores = extract_multi_scores(raw_response)
 
+        # Convert raw predicted final scores (out of 45) to percentage
+        final_weight = grading_scheme.get("Final", 45)
+        normalized_scores = {
+            label: round((float(score) / final_weight) * 100, 2)
+            for label, score in scores.items()
+        }
+
         return jsonify({
-            "input": input_values,
+            "input": normalized_input,
             "context": similar_records,
             "prompt": prompt,
-            "prediction": {
-                "Optimistic": scores["Optimistic"],
-                "Base": scores["Base"],
-                "Pessimistic": scores["Pessimistic"]
-            }
-        })
+            "prediction": normalized_scores
+        }), 200
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 

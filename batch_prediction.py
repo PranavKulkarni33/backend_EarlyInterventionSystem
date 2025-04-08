@@ -1,22 +1,13 @@
-# batch_prediction.py
-
 import pandas as pd
-import re
+import json
 import uuid
 import os
-
 from config import s3_client, S3_BUCKET
-from rag_utils import (
-    load_faiss_index_from_paths,
-    get_context_records,
-    format_prompt_for_prediction
-)
+from rag_utils import load_faiss_index_from_paths, get_context_records, format_prompt_for_prediction
 from bedrock_integration import query_bedrock
 from preprocessing import preprocess_data
-from storage import upload_to_s3  # Used for uploading final report
-from config import grading_scheme_map
+from storage import upload_to_s3
 from report_utils import generate_report_df, send_report_email
-
 
 
 def run_batch_prediction(file_name, course_name, threshold=35, email="instructor@example.com"):
@@ -24,31 +15,59 @@ def run_batch_prediction(file_name, course_name, threshold=35, email="instructor
     local_csv_path = f"/tmp/{file_name}"
     preprocessed_csv_path = f"/tmp/{safe_course}_preprocessed.csv"
     index_path = f"/tmp/{safe_course}_faiss.index"
+    metadata_path = f"/tmp/{safe_course}_metadata.json"
 
     # Download required files
     s3_client.download_file(S3_BUCKET, file_name, local_csv_path)
     s3_client.download_file(S3_BUCKET, f"{safe_course}_preprocessed.csv", preprocessed_csv_path)
     s3_client.download_file(S3_BUCKET, f"{safe_course}_faiss.index", index_path)
+    s3_client.download_file(S3_BUCKET, f"{safe_course}_metadata.json", metadata_path)
 
-    # Load and normalize the batch input
+    # Load metadata
+    with open(metadata_path, "r") as f:
+        metadata = json.load(f)
+
+    grading_scheme = metadata.get("gradingScheme", {})
+    out_of_marks = metadata.get("outOfMarks", {})
+
+    # Normalize raw input using metadata
     raw_df = pd.read_csv(local_csv_path)
-    grading_scheme = grading_scheme_map.get(course_name, {})
-    normalized_df = preprocess_data(raw_df.to_dict(orient="records"), grading_scheme)
+    df = raw_df.fillna(0).apply(pd.to_numeric, errors='coerce').fillna(0)
 
+    # Normalize by outOf and apply weightage
+    component_columns = {}
+
+    for col in df.columns:
+        for component in grading_scheme:
+            if col.lower().startswith(component.lower().replace(" ", "")):
+                component_columns.setdefault(component, []).append(col)
+                break
+
+    for component, columns in component_columns.items():
+        weight = grading_scheme.get(component, 0)
+        out_of = out_of_marks.get(component, 1)
+        split_weight = weight / len(columns) if len(columns) > 0 else 0
+
+        for col in columns:
+            df[col] = ((df[col] / out_of) * split_weight).round(2)
+
+    normalized_df = df
+
+    # Load KB
     index, kb_df = load_faiss_index_from_paths(index_path, preprocessed_csv_path)
 
+    # Predict row-by-row
     predictions = []
     for _, row in normalized_df.iterrows():
         input_values = row.to_dict()
-        selected_attributes = [col for col in row.keys() if col.lower() != "final"]
+        selected_attributes = list(row.keys())
 
         try:
-            context = get_context_records(kb_df, index, input_values, selected_attributes)
+            context = get_context_records(kb_df, index, input_values, selected_attributes, top_k=10)
             prompt = format_prompt_for_prediction(input_values, selected_attributes, context, grading_scheme)
             prediction_response = query_bedrock(prompt)
             scores = extract_multi_scores(prediction_response)
         except Exception as e:
-            # Log and skip row
             scores = {"Base": "-", "Optimistic": "-", "Pessimistic": "-"}
 
         predictions.append({
@@ -58,7 +77,7 @@ def run_batch_prediction(file_name, course_name, threshold=35, email="instructor
             "Pessimistic": scores["Pessimistic"]
         })
 
-    # Save the raw report
+    # Save & Upload Report
     report_df = pd.DataFrame(predictions)
     report_filename = f"{safe_course}_report_{uuid.uuid4().hex[:6]}.csv"
     report_path = f"/tmp/{report_filename}"
@@ -67,10 +86,9 @@ def run_batch_prediction(file_name, course_name, threshold=35, email="instructor
     upload_key = f"reports/{report_filename}"
     upload_to_s3(report_path, upload_key)
 
-    # Highlight AtRisk column
+    # Annotate At-Risk Students
     report_df = generate_report_df(report_df.to_dict(orient="records"), threshold)
 
-    #  Email report to instructor
     send_report_email(
         recipient_email=email,
         report_df=report_df,
@@ -85,15 +103,8 @@ def run_batch_prediction(file_name, course_name, threshold=35, email="instructor
     }
 
 
-
 def extract_multi_scores(response):
-    """
-    Extracts optimistic, base, and pessimistic scores from the model response.
-    Returns a dictionary of the three scores.
-    Raises a ValueError if any score is missing.
-    """
     import re
-
     pattern = {
         "Optimistic": r"Optimistic:\s*(\d+(?:\.\d+)?)",
         "Base": r"Base:\s*(\d+(?:\.\d+)?)",
@@ -109,6 +120,3 @@ def extract_multi_scores(response):
             raise ValueError(f"Missing score for {label} in response: {response}")
 
     return scores
-
-
-

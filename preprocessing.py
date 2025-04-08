@@ -1,17 +1,16 @@
 import pandas as pd
 
-def preprocess_data(grades, weightage):
-    """
-    Preprocess the student grades by normalizing based on weightage.
-    Missing values are replaced with 0.
-    """
+
+def preprocess_data(grades, weightage, out_of_marks):
+    import pandas as pd
+
     df = pd.DataFrame(grades)
     df.fillna(0, inplace=True)
 
-    # Convert all values to numeric (string to int/float)
+    # Convert to numeric (in case of strings)
     df = df.apply(pd.to_numeric, errors='coerce').fillna(0)
 
-    # Group columns by entity (e.g., Quiz1, Quiz2 → Quiz)
+    # Group columns by component type (e.g., Quiz1, Quiz2 → Quiz)
     entity_groups = {}
     for col in df.columns:
         for entity in weightage:
@@ -20,10 +19,15 @@ def preprocess_data(grades, weightage):
             if col_clean.startswith(entity_clean):
                 entity_groups.setdefault(entity, []).append(col)
 
-    # Normalize each grouped column to percentage
+    # Normalize: percentage → weighted percentage
     for entity, columns in entity_groups.items():
+        n = len(columns)
+        weight_per_column = weightage[entity] / n
+        out_of = out_of_marks.get(entity, 1)
+
         for col in columns:
-            max_score = df[col].max() if df[col].max() > 0 else 1
-            df[col] = ((df[col] / max_score) * 100).round(2)
+            # Convert raw score → percentage of `out_of` → weighted
+            df[col] = ((df[col] / out_of) * weight_per_column).round(2)
 
     return df
+

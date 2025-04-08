@@ -4,6 +4,7 @@ import os
 import numpy as np
 from embedding import model  # SentenceTransformer("all-MiniLM-L6-v2")
 from config import grading_scheme_map as grading_scheme
+import textwrap
 
 
 def load_faiss_index(course_name):
@@ -39,7 +40,7 @@ def input_to_sentence(input_values, selected_attributes):
     return " | ".join(parts)
 
 
-def get_context_records(df, index, input_values, selected_attributes, top_k=3):
+def get_context_records(df, index, input_values, selected_attributes, top_k=10):
     input_str = input_to_sentence(input_values, selected_attributes)
     query_vec = model.encode([input_str]).astype("float32")
     distances, indices = index.search(query_vec, top_k)
@@ -48,32 +49,37 @@ def get_context_records(df, index, input_values, selected_attributes, top_k=3):
 
 def format_prompt_for_prediction(input_values, selected_attributes, context_records, grading_weights, comment=""):
     prompt = (
-        "You are an academic performance predictor. Use the grading scheme and context of similar students "
-        "to predict the Final exam score as a percentage (0-100).\n\n"
-        f"Grading Scheme: {grading_weights}\n"
+        "You are an AI that predicts a student's Final exam score as a percentage (0–100).\n\n"
+        "INSTRUCTION:\n"
+        "Use the student's weighted scores and similar records to predict performance.\n\n"
+        f"Grading Scheme (weights in %): {grading_weights}\n\n"
         "Student Attributes:\n"
     )
+
     for attr in selected_attributes:
-        val = input_values.get(attr, "N/A")
-        prompt += f"- {attr}: {val}\n"
+        prompt += f"- {attr}: {input_values.get(attr, 'N/A')}\n"
 
     if comment:
-        prompt += f"Instructor's Comment: {comment}\n"
+        prompt += f"\nInstructor's Note: {comment}\n"
 
-    prompt += "\nSimilar Student Records:\n"
+    prompt += f"\nSimilar Student Records (Top {len(context_records)}):\n"
     for i, record in enumerate(context_records, 1):
-        record_str = ", ".join([f"{k}: {v}" for k, v in record.items()])
-        prompt += f"{i}. {record_str}\n"
+        simplified = ", ".join([f"{k}: {v}" for k, v in record.items()])
+        prompt += f"{i}. {simplified}\n"
 
     prompt += (
-        "\nNow predict the student's Final exam score in three cases:\n"
-        "- Optimistic (if the student improves):\n"
-        "- Base (if the student maintains similar performance):\n"
-        "- Pessimistic (if the student does worse):\n\n"
-        "You MUST respond ONLY in this exact format with numeric values:\n"
-        "Optimistic: <score>\nBase: <score>\nPessimistic: <score>\n"
-        "Do not include explanations or ranges. Return only these three values."
+        "\n✍Now predict the Final exam score in THREE cases:\n"
+        "- Optimistic (if student improves)\n"
+        "- Base (same performance)\n"
+        "- Pessimistic (if student declines)\n\n"
+        "⚠IMPORTANT:\n"
+        "Your response MUST be in this **exact format**:\n"
+        "Optimistic: <numeric_value>\n"
+        "Base: <numeric_value>\n"
+        "Pessimistic: <numeric_value>\n\n"
+        "Only return these three lines. Do NOT explain or add anything else."
     )
 
     return prompt
+
 

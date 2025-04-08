@@ -10,10 +10,15 @@ ses_client = boto3.client("ses", region_name="us-east-1")
 SENDER_EMAIL = "earlyinterventionsystematyork@gmail.com"
 
 
-def generate_report_df(predictions, threshold=35):
-    df = pd.DataFrame(predictions)
-    df["AtRisk"] = df["Base"].astype(float) < threshold  # Use Base score now
+def generate_report_df(records, threshold):
+    df = pd.DataFrame(records)
+
+    # Replace missing or failed predictions with NaN
+    df["Base"] = pd.to_numeric(df["Base"], errors='coerce')  # invalid strings like '-' → NaN
+    df["AtRisk"] = df["Base"] < threshold  # only valid numbers will be checked
+    df["Base"] = df["Base"].fillna("-")  # keep display consistent
     return df
+
 
 
 def send_report_email(recipient_email, report_df, report_path, course_name, threshold=35):
